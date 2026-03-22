@@ -73,7 +73,7 @@ async function yaSubmitScore(s) {
   try {
     if (!ysdk || !yPlayer?.isAuthorized()) return;
     const ok = await ysdk.isAvailableMethod('leaderboards.setScore');
-    if (ok) await ysdk.leaderboards.setScore('cosmic_defender', s);
+    if (ok) await ysdk.leaderboards.setScore('cosmicdefender', s);
   } catch(_) {}
 }
 
@@ -171,6 +171,8 @@ const DIFF_BXS = { easy: GW*0.17, normal: GW*0.50, hard: GW*0.83 };
 
 // Language button area
 const LANG_BTN = { x: GW - 58, y: 18, w: 44, h: 24 };
+// Mute button
+const MUTE_BTN = { x: 14, y: 18, w: 32, h: 24 };
 
 // ═══════════════════════════════════════════════════════════════════════
 //  STATE
@@ -194,7 +196,7 @@ function introTick() {
   introFrame++;
   if (introFrame >= INTRO_DURATION) {
     STATE = 'loading';
-    setTimeout(() => { if (STATE === 'loading') STATE = 'menu'; }, 1400);
+    setTimeout(() => { if (STATE === 'loading') { STATE = 'menu'; startMusic(); } }, 1400);
   }
 }
 function skipIntro() {
@@ -235,6 +237,8 @@ function getXY(clientX, clientY) {
 
 function handleDown(cx, cy) {
   if (STATE === 'intro') { skipIntro(); return; }
+  // Mute button
+  if (cx>=MUTE_BTN.x && cx<=MUTE_BTN.x+MUTE_BTN.w && cy>=MUTE_BTN.y-MUTE_BTN.h/2 && cy<=MUTE_BTN.y+MUTE_BTN.h/2) { ensureAudio(); toggleMute(); return; }
   // Lang button (visible in menu)
   if (STATE==='menu') {
     if (cx>=LANG_BTN.x && cx<=LANG_BTN.x+LANG_BTN.w &&
@@ -359,15 +363,19 @@ function startGame() {
   mouseX=GW/2; mouseY=GH-80; mouseOnCanvas=false;
   initPlayer(); spawnWave();
   yaStart(); // Yandex: notify gameplay started
+  startMusic();
 }
 
 function onWaveComplete() {
   level++; adWaveCounter++;
+  SFX.waveStart();
   // Show fullscreen ad every 3 completed waves (pauses & resumes gameplay)
   if (adWaveCounter >= 3) {
     adWaveCounter = 0;
     STATE = 'ad';
-    yaShowAd(() => {
+    pauseMusicForAd();
+  yaShowAd(() => {
+      resumeMusicAfterAd();
       spawnWave();
       STATE = 'playing';
     });
@@ -379,14 +387,16 @@ function onWaveComplete() {
 function hitPlayer() {
   if (player.invincible>0) return;
   if (player.shield>0) {
-    player.shield=0; burst(player.x,player.y,'#44ffff',14); screenShake=6; return;
+    player.shield=0; burst(player.x,player.y,'#44ffff',14); screenShake=6; SFX.shield(); return;
   }
   burst(player.x, player.y, '#4488ff', 12);
+  SFX.playerHit();
   lives--;
   player.invincible=130;
   if (lives<=0) {
     screenShake=0;
     STATE='gameover';
+    SFX.gameOver();
     yaStop(); // Yandex: stop gameplay
     // Save score
     if (score > highScore) {
@@ -433,6 +443,7 @@ function update() {
     player.cooldown=rate;
     const bx=player.x, by=player.y-player.h/2+4;
     bullets.push({x:bx,y:by,vx:0,vy:-11});
+    SFX.shoot();
     if (player.spread>0) {
       bullets.push({x:bx,y:by,vx:-2.8,vy:-10.2});
       bullets.push({x:bx,y:by,vx: 2.8,vy:-10.2});
@@ -453,13 +464,14 @@ function update() {
       const e=enemies[ei];
       if (Math.abs(b.x-e.x)<e.w/2+2 && Math.abs(b.y-e.y)<e.h/2+2) {
         hit=true; burst(b.x,b.y,e.col,5); e.hp--;
+        if (e.hp > 0) SFX.enemyHit();
         if (e.hp<=0) {
           combo++; comboTimer=130;
           score+=e.pts*(1+Math.floor(combo/3));
           if (score>highScore) { highScore=score; localStorage.setItem('cd_hi',highScore); }
           burst(e.x,e.y,e.col,e.type==='boss'?28:14);
           spawnPowerup(e.x,e.y);
-          if (e.type==='boss') screenShake=18;
+          if (e.type==='boss') { screenShake=18; SFX.bossDie(); } else { SFX.enemyDie(); }
           enemies.splice(ei,1);
         }
       }
@@ -514,7 +526,7 @@ function update() {
   for (let i=powerups.length-1; i>=0; i--) {
     const p=powerups[i]; p.y+=p.vy; p.life--;
     if (p.life<=0||p.y>GH+20) { powerups.splice(i,1); continue; }
-    if (Math.abs(p.x-player.x)<22&&Math.abs(p.y-player.y)<22) { applyPowerup(p.type); powerups.splice(i,1); }
+    if (Math.abs(p.x-player.x)<22&&Math.abs(p.y-player.y)<22) { applyPowerup(p.type); SFX.powerup(); powerups.splice(i,1); }
   }
 
   // Particles
@@ -612,6 +624,263 @@ function drawPowerup(p) {
   ctx.restore();
 }
 
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  AUDIO ENGINE  (Web Audio API — no HTML elements, no system player)
+//  Satisfies: п.1.3 (mute on hide), п.1.6.1.6/1.6.2.5 (no system player),
+//             п.4.7 (pause on ad), п.6.2 (mute button)
+// ═══════════════════════════════════════════════════════════════════════
+let audioCtx = null;
+let masterGain = null;
+let musicGain  = null;
+let sfxGain    = null;
+let isMuted    = false;
+let musicNodes = [];  // active oscillator refs for music
+let musicPlaying = false;
+
+function ensureAudio() {
+  if (audioCtx) return true;
+  try {
+    audioCtx   = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    musicGain  = audioCtx.createGain();
+    sfxGain    = audioCtx.createGain();
+    masterGain.gain.value = 1.0;
+    musicGain.gain.value  = 0.22;
+    sfxGain.gain.value    = 0.55;
+    musicGain.connect(masterGain);
+    sfxGain.connect(masterGain);
+    masterGain.connect(audioCtx.destination);
+    return true;
+  } catch(e) { return false; }
+}
+
+function setMute(m) {
+  isMuted = m;
+  if (!masterGain) return;
+  masterGain.gain.setTargetAtTime(m ? 0 : 1, audioCtx.currentTime, 0.05);
+}
+
+function toggleMute() { setMute(!isMuted); }
+
+// п.1.3 — stop sound when page hidden
+document.addEventListener('visibilitychange', () => {
+  if (!audioCtx) return;
+  if (document.hidden) {
+    audioCtx.suspend();
+  } else {
+    audioCtx.resume();
+  }
+});
+
+// ── SFX helpers ──────────────────────────────────────────────────────────
+function playTone(freq, type, duration, gainVal, freqEnd, delay=0) {
+  if (!ensureAudio()) return;
+  const t   = audioCtx.currentTime + delay;
+  const osc = audioCtx.createOscillator();
+  const g   = audioCtx.createGain();
+  osc.type  = type;
+  osc.frequency.setValueAtTime(freq, t);
+  if (freqEnd !== undefined) osc.frequency.exponentialRampToValueAtTime(freqEnd, t + duration);
+  g.gain.setValueAtTime(gainVal, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+  osc.connect(g); g.connect(sfxGain);
+  osc.start(t); osc.stop(t + duration + 0.02);
+}
+
+function playNoise(duration, gainVal, filterFreq, delay=0) {
+  if (!ensureAudio()) return;
+  const t      = audioCtx.currentTime + delay;
+  const bufLen = Math.floor(audioCtx.sampleRate * duration);
+  const buf    = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const data   = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+  const src    = audioCtx.createBufferSource();
+  src.buffer   = buf;
+  const filt   = audioCtx.createBiquadFilter();
+  filt.type    = 'bandpass';
+  filt.frequency.value = filterFreq;
+  filt.Q.value = 0.8;
+  const g      = audioCtx.createGain();
+  g.gain.setValueAtTime(gainVal, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+  src.connect(filt); filt.connect(g); g.connect(sfxGain);
+  src.start(t); src.stop(t + duration + 0.02);
+}
+
+// ── SOUND EFFECTS ────────────────────────────────────────────────────────
+const SFX = {
+  shoot() {
+    playTone(820, 'square', 0.07, 0.4, 380);
+    playTone(420, 'sine',   0.06, 0.15, 200, 0.01);
+  },
+  enemyHit() {
+    playNoise(0.08, 0.3, 900);
+    playTone(280, 'sawtooth', 0.07, 0.2, 120);
+  },
+  enemyDie() {
+    playNoise(0.18, 0.5, 700);
+    playTone(200, 'sawtooth', 0.14, 0.3, 60);
+    playTone(350, 'square', 0.10, 0.2, 80, 0.04);
+  },
+  bossDie() {
+    for (let i = 0; i < 5; i++) {
+      playNoise(0.25, 0.6, 400 + i*120, i * 0.07);
+      playTone(180 - i*20, 'sawtooth', 0.2, 0.35, 40, i * 0.07);
+    }
+  },
+  playerHit() {
+    playNoise(0.22, 0.7, 300);
+    playTone(160, 'sawtooth', 0.18, 0.45, 55);
+    playTone(90,  'square',   0.15, 0.2,  40, 0.06);
+  },
+  powerup() {
+    [0, 0.07, 0.14, 0.21].forEach((d, i) => {
+      playTone([440,550,660,880][i], 'sine', 0.12, 0.4, [480,600,720,960][i], d);
+    });
+  },
+  waveStart() {
+    [0, 0.1, 0.2].forEach((d, i) => {
+      playTone([330,440,550][i], 'sine', 0.15, 0.35, [360,480,600][i], d);
+    });
+  },
+  gameOver() {
+    [0, 0.15, 0.30, 0.48].forEach((d, i) => {
+      playTone([440,370,280,180][i], 'sawtooth', 0.22, 0.4, [400,320,220,100][i], d);
+    });
+  },
+  menuClick() {
+    playTone(520, 'sine', 0.08, 0.3, 600);
+  },
+  shield() {
+    playTone(660, 'sine', 0.12, 0.35, 880);
+    playTone(880, 'sine', 0.10, 0.2,  1100, 0.06);
+  }
+};
+
+// ── BACKGROUND MUSIC ─────────────────────────────────────────────────────
+// Chiptune melody — procedural, loops every ~8 bars
+// Notes: C4=261, D=293, E=329, F=349, G=391, A=440, B=493, C5=523
+const MELODY = [
+  [523,0.12],[493,0.10],[440,0.12],[493,0.10],
+  [523,0.12],[523,0.10],[587,0.18],[0,0.10],
+  [523,0.12],[440,0.10],[392,0.12],[440,0.10],
+  [493,0.14],[440,0.12],[392,0.20],[0,0.12],
+  [349,0.12],[392,0.10],[440,0.12],[493,0.10],
+  [523,0.14],[587,0.12],[659,0.20],[0,0.10],
+  [587,0.12],[523,0.10],[493,0.12],[440,0.10],
+  [392,0.16],[349,0.12],[294,0.22],[0,0.14],
+];
+
+const BASS = [
+  [130,0.24],[0,0.08],[147,0.24],[0,0.08],
+  [130,0.24],[0,0.08],[174,0.24],[0,0.08],
+  [110,0.24],[0,0.08],[130,0.24],[0,0.08],
+  [98, 0.24],[0,0.08],[110,0.24],[0,0.08],
+];
+
+let musicTimeout = null;
+
+function startMusic() {
+  if (!ensureAudio()) return;
+  if (musicPlaying) return;
+  musicPlaying = true;
+  scheduleMusicLoop();
+}
+
+function stopMusic() {
+  musicPlaying = false;
+  if (musicTimeout) { clearTimeout(musicTimeout); musicTimeout = null; }
+  musicNodes.forEach(n => { try { n.stop(); } catch(_){} });
+  musicNodes = [];
+}
+
+function scheduleMusicLoop() {
+  if (!musicPlaying) return;
+  const t0 = audioCtx.currentTime + 0.05;
+
+  // Play melody
+  let offset = 0;
+  MELODY.forEach(([freq, dur]) => {
+    if (freq > 0) {
+      const osc = audioCtx.createOscillator();
+      const g   = audioCtx.createGain();
+      osc.type  = 'square';
+      osc.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t0 + offset);
+      g.gain.linearRampToValueAtTime(1, t0 + offset + 0.01);
+      g.gain.setValueAtTime(1, t0 + offset + dur * 0.75);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + offset + dur * 0.95);
+      osc.connect(g); g.connect(musicGain);
+      osc.start(t0 + offset);
+      osc.stop(t0 + offset + dur);
+      musicNodes.push(osc);
+    }
+    offset += dur;
+  });
+
+  const totalDur = offset;
+
+  // Play bass at half the melody speed (loop twice)
+  let bassOffset = 0;
+  for (let rep = 0; rep < 2; rep++) {
+    BASS.forEach(([freq, dur]) => {
+      const realDur = dur * 2;
+      if (freq > 0) {
+        const osc = audioCtx.createOscillator();
+        const g   = audioCtx.createGain();
+        osc.type  = 'triangle';
+        osc.frequency.value = freq;
+        g.gain.setValueAtTime(0.0001, t0 + bassOffset);
+        g.gain.linearRampToValueAtTime(0.7, t0 + bassOffset + 0.02);
+        g.gain.setValueAtTime(0.7, t0 + bassOffset + realDur * 0.7);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + bassOffset + realDur * 0.9);
+        osc.connect(g); g.connect(musicGain);
+        osc.start(t0 + bassOffset);
+        osc.stop(t0 + bassOffset + realDur);
+        musicNodes.push(osc);
+      }
+      bassOffset += realDur;
+    });
+  }
+
+  // Subtle hi-hat rhythm
+  for (let i = 0; i < Math.floor(totalDur / 0.125); i++) {
+    const ht = t0 + i * 0.125;
+    const bufLen = Math.floor(audioCtx.sampleRate * 0.04);
+    const buf    = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+    const data   = buf.getChannelData(0);
+    for (let k = 0; k < bufLen; k++) data[k] = Math.random() * 2 - 1;
+    const src  = audioCtx.createBufferSource();
+    src.buffer = buf;
+    const filt = audioCtx.createBiquadFilter();
+    filt.type  = 'highpass';
+    filt.frequency.value = 8000;
+    const g    = audioCtx.createGain();
+    const vel  = (i % 4 === 0) ? 0.15 : (i % 2 === 0) ? 0.07 : 0.03;
+    g.gain.setValueAtTime(vel, ht);
+    g.gain.exponentialRampToValueAtTime(0.0001, ht + 0.035);
+    src.connect(filt); filt.connect(g); g.connect(musicGain);
+    src.start(ht); src.stop(ht + 0.05);
+  }
+
+  // Schedule next loop
+  const loopMs = totalDur * 1000;
+  musicTimeout = setTimeout(() => {
+    musicNodes = [];
+    scheduleMusicLoop();
+  }, loopMs);
+}
+
+function pauseMusicForAd() {
+  if (!audioCtx) return;
+  masterGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+}
+function resumeMusicAfterAd() {
+  if (!audioCtx || isMuted) return;
+  masterGain.gain.setTargetAtTime(1, audioCtx.currentTime, 0.1);
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 //  INTRO
@@ -753,6 +1022,22 @@ function drawBG() {
   });
 }
 
+
+function drawMuteBtn(inMenu) {
+  ctx.save();
+  const mx = MUTE_BTN.x, my = MUTE_BTN.y;
+  ctx.shadowBlur=8; ctx.shadowColor='#4466ff';
+  roundRect(mx, my-MUTE_BTN.h/2, MUTE_BTN.w, MUTE_BTN.h, 5);
+  ctx.fillStyle='#ffffff18'; ctx.fill();
+  ctx.strokeStyle= inMenu ? '#4466ff' : '#334466';
+  ctx.lineWidth=1.5; ctx.stroke();
+  ctx.shadowBlur=0;
+  ctx.font='16px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#aabbff';
+  ctx.fillText(isMuted ? '🔇' : '🔊', mx + MUTE_BTN.w/2, my);
+  ctx.restore();
+}
+
 function drawLangButton() {
   ctx.save();
   ctx.shadowBlur=8; ctx.shadowColor='#4466ff';
@@ -830,6 +1115,7 @@ function drawMenu() {
   }
 
   drawLangButton();
+  drawMuteBtn(true);
   ctx.restore();
 }
 
@@ -867,6 +1153,7 @@ function drawHUD() {
     ctx.fillText(combo+'x COMBO!', GW/2, GH/2-70);
     ctx.shadowBlur=0;
   }
+  drawMuteBtn(false);
   ctx.restore();
 }
 
